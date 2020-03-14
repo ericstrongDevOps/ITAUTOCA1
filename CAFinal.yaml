@@ -1,0 +1,781 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Highly available BlueGreenDeployment-POC WebServer IAC template with cloud9 and ansible
+
+Parameters:
+  REGION:
+    Description: Select Region to deploy resources
+    Type: String
+    Default: eu-west-1
+    AllowedValues:
+      - eu-west-1
+      - eu-west-2
+  DEPLOY:
+    Description: Select an Environment to provision Test or Production
+    Type: String
+    Default: Test
+    AllowedValues:
+      - Test
+      - Production
+  RepoName:
+    Description: CodeCommit Repo Name
+    Type: String
+    Default: 'POCAutomation'
+  ENV:
+    Description: Select Environment to launch webserver
+    Type: String
+    Default: Blue
+    AllowedValues:
+      - Blue
+      - Green
+  NumberOfInstances:
+    Description: number of ec2 instances
+    Type: String
+    Default: '1'
+    AllowedValues:
+    - '1'
+    - '2'
+    - '3'
+  InstanceType:
+    Description: WebServer EC2 instance type
+    Type: String
+    Default: t2.small
+    AllowedValues:
+    - t2.nano
+    - t2.micro
+    - t2.small
+
+    ConstraintDescription: must be a valid EC2 instance type.
+  KeyName:
+    Default: POC
+    Description: The EC2 Key Pair to allow SSH access to the instances
+    Type: AWS::EC2::KeyPair::KeyName
+    ConstraintDescription: must be the name of an existing EC2 KeyPair.
+
+Mappings:
+  Region2Examples:
+      us-east-1:
+        Examples: https://s3.amazonaws.com/cloudformation-examples-us-east-1
+      us-west-2:
+        Examples: https://s3-us-west-2.amazonaws.com/cloudformation-examples-us-west-2
+      us-west-1:
+        Examples: https://s3-us-west-1.amazonaws.com/cloudformation-examples-us-west-1
+      eu-west-1:
+        Examples: https://s3-eu-west-1.amazonaws.com/cloudformation-examples-eu-west-1
+      eu-west-2:
+        Examples: https://s3-eu-west-2.amazonaws.com/cloudformation-examples-eu-west-2
+      eu-west-3:
+        Examples: https://s3-eu-west-3.amazonaws.com/cloudformation-examples-eu-west-3
+      eu-north-1:
+        Examples: https://s3-eu-north-1.amazonaws.com/cloudformation-examples-eu-north-1
+      eu-central-1:
+        Examples: https://s3-eu-central-1.amazonaws.com/cloudformation-examples-eu-central-1
+      ap-southeast-1:
+        Examples: https://s3-ap-southeast-1.amazonaws.com/cloudformation-examples-ap-southeast-1
+      ap-northeast-1:
+        Examples: https://s3-ap-northeast-1.amazonaws.com/cloudformation-examples-ap-northeast-1
+      ap-northeast-2:
+        Examples: https://s3-ap-northeast-2.amazonaws.com/cloudformation-examples-ap-northeast-2
+      ap-northeast-3:
+        Examples: https://s3-ap-northeast-3.amazonaws.com/cloudformation-examples-ap-northeast-3
+      ap-southeast-2:
+        Examples: https://s3-ap-southeast-2.amazonaws.com/cloudformation-examples-ap-southeast-2
+      ap-south-1:
+        Examples: https://s3-ap-south-1.amazonaws.com/cloudformation-examples-ap-south-1
+      us-east-2:
+        Examples: https://s3-us-east-2.amazonaws.com/cloudformation-examples-us-east-2
+      ca-central-1:
+        Examples: https://s3-ca-central-1.amazonaws.com/cloudformation-examples-ca-central-1
+      sa-east-1:
+        Examples: https://s3-sa-east-1.amazonaws.com/cloudformation-examples-sa-east-1
+      cn-north-1:
+        Examples: https://s3.cn-north-1.amazonaws.com.cn/cloudformation-examples-cn-north-1
+      cn-northwest-1:
+        Examples: https://s3.cn-northwest-1.amazonaws.com.cn/cloudformation-examples-cn-northwest-1   
+  AWSInstanceType2Arch:
+    t2.nano:
+      Arch: AmazonLinux
+    t2.micro:
+      Arch: AmazonLinux
+    t2.small:
+      Arch: AmazonLinux
+  AWSRegionArch2AMI:
+    eu-west-1:
+      AmazonLinux: ami-08935252a36e25f85
+    eu-west-2:
+      AmazonLinux: ami-01419b804382064e4
+    eu-west-3:
+      AmazonLinux: ami-0dd7e7ed60da8fb83
+
+Conditions: 
+  IsBlueEnvironment: !Equals [ !Ref ENV, Blue]
+
+Resources:
+######################## CLOUD 9 ##################################################
+  Cloud9env:
+    Type: AWS::Cloud9::EnvironmentEC2
+    Properties: 
+      AutomaticStopTimeMinutes: 20160
+      Description: bastion host env for ansible controller
+      InstanceType: !Ref InstanceType
+      #Name: cloud9 bastion
+      Name: !Join [" ", [cloud9 bastion,!Ref DEPLOY, !Ref ENV ]]
+      SubnetId: !If [IsBlueEnvironment, !Ref BluePublicSubnet1, !Ref GreenPublicSubnet2]
+      Repositories:
+          - RepositoryUrl: !Sub 'https://git-codecommit.${AWS::Region}.amazonaws.com/v1/repos/${RepoName}'
+            PathComponent: !Sub 'codecommit/${RepoName}'
+      Tags: 
+        - Key: POC
+          Value: cloud9
+
+######################## AUTO SCALING GROUP #######################################
+  WebServerGroupBlue:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn: 
+     - NATGateway
+     - ApplicationLoadBalancer
+    Properties:
+      VPCZoneIdentifier:
+        - !Ref BluePrivateSubnet1
+        
+      LaunchConfigurationName:
+        Ref: LaunchConfig
+      MinSize: !Ref NumberOfInstances
+      MaxSize: !Ref NumberOfInstances
+      TargetGroupARNs:
+        - Ref: BlueTargetGroup
+  WebServerGroupGreen:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn: 
+    - NATGateway
+    - ApplicationLoadBalancer
+    Properties:
+      VPCZoneIdentifier:
+        - !Ref GreenPrivateSubnet2
+        
+      LaunchConfigurationName:
+        Ref: LaunchConfig
+      MinSize: !Ref NumberOfInstances
+      MaxSize: !Ref NumberOfInstances
+      TargetGroupARNs:
+        - Ref: GreenTargetGroup  
+
+######################## LAUNCH CONFIG ############################################
+# The launch config template for userdata and metadate was taken from the AWS website 
+  LaunchConfig:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    DependsOn: NATGateway
+    Properties:
+      KeyName:
+        Ref: KeyName
+      ImageId:
+        Fn::FindInMap:
+        - AWSRegionArch2AMI
+        - Ref: AWS::Region
+        - Fn::FindInMap:
+          - AWSInstanceType2Arch
+          - Ref: InstanceType
+          - Arch
+      SecurityGroups:
+      - Ref: lbswsg
+      - Ref: dbsg
+      - Ref: natsg
+      - Ref: elbsg
+      InstanceType:
+        Ref: InstanceType
+      UserData:
+        Fn::Base64:
+          Fn::Join:
+          - ''
+          - - "#!/bin/bash -xe\n"
+            - 'yum update -y aws-cfn-bootstrap
+
+'
+            - "/opt/aws/bin/cfn-init -v "
+            - "         --stack "
+            - Ref: AWS::StackName
+            - "         --resource LaunchConfig "
+            - "         --region "
+            - Ref: AWS::Region
+            - "\n"
+            - "/opt/aws/bin/cfn-signal -e $? "
+            - "         --stack "
+            - Ref: AWS::StackName
+            - "         --resource WebServerGroup"
+            - Ref: ENV
+            - " "
+            - "         --region "
+            - Ref: AWS::Region
+            - "\n"
+            - "mkdir testing /home/ec2-user"
+            - "\n"
+            - "echo ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQCrxEogCCYHrKDdxwYgQ92p+qtBZbmfrmGuwAFs07bKWY8dusyphRIQZe5xiRsOl4zMvrfSYV4pboU30Qr0c0CEflIVKQ4c2RFCapKRABJLbuWFv+4892PGKtQAarKXF9x+7tr/QraUheM+I+sA6LwuL8+SpNPdIV5nRW9OLxUDA1dIDrKmMgZKS+E0MUsVoMql3C7GJiYSjklGLoDwR0RR8veqNwFyqwrtqxkjERT1ELrElUZYzv0JT4Wf80shiUi8tP+p8a+KGb4GarXpX1FicF1bjjCCXHP9QRfTdwcPMXOIDjhKmRrMYMLWoYu2NE567vtd9Wp07hx9ThnvRunJ POC > /home/ec2-user/.ssh/authorized_keys"
+    Metadata:
+      Comment: Install a simple application
+      AWS::CloudFormation::Init:
+        config:
+          packages:
+            yum:
+              httpd: []
+          files:
+            "/var/www/html/index.html":
+              content:
+                Fn::Join:
+                - "\n"
+                - - <img src="
+                  - Fn::FindInMap:
+                    - Region2Examples
+                    - Ref: AWS::Region
+                    - Examples
+                  - /cloudformation_graphic.png" alt="AWS CloudFormation Logo"/>
+                  - "<h1>Welcome Eric</h1>"
+              mode: '000644'
+              owner: root
+              group: root
+            "/etc/cfn/cfn-hup.conf":
+              content:
+                Fn::Join:
+                - ''
+                - - "[main]\n"
+                  - stack=
+                  - Ref: AWS::StackId
+                  - "\n"
+                  - region=
+                  - Ref: AWS::Region
+                  - "\n"
+              mode: '000400'
+              owner: root
+              group: root
+            "/etc/cfn/hooks.d/cfn-auto-reloader.conf":
+              content:
+                Fn::Join:
+                - ''
+                - - "[cfn-auto-reloader-hook]\n"
+                  - 'triggers=post.update
+
+'
+                  - 'path=Resources.LaunchConfig.Metadata.AWS::CloudFormation::Init
+
+'
+                  - 'action=/opt/aws/bin/cfn-init -v '
+                  - "         --stack "
+                  - Ref: AWS::StackName
+                  - "         --resource LaunchConfig "
+                  - "         --region "
+                  - Ref: AWS::Region
+                  - "\n"
+                  - 'runas=root
+
+'
+              mode: '000400'
+              owner: root
+              group: root
+          services:
+            sysvinit:
+              httpd:
+                enabled: 'true'
+                ensureRunning: 'true'
+              cfn-hup:
+                enabled: 'true'
+                ensureRunning: 'true'
+                files:
+                - "/etc/cfn/cfn-hup.conf"
+                - "/etc/cfn/hooks.d/cfn-auto-reloader.conf"
+
+  WebServerScaleUpPolicyB:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AdjustmentType: ChangeInCapacity
+      AutoScalingGroupName:
+        Ref: WebServerGroupBlue
+      Cooldown: '60'
+      ScalingAdjustment: '1'  
+  WebServerScaleDownPolicyB:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AdjustmentType: ChangeInCapacity
+      AutoScalingGroupName:
+        Ref: WebServerGroupBlue
+      Cooldown: '60'
+      ScalingAdjustment: "-1"   
+  CPUAlarmHighB:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Scale-up if CPU > 90% for 10 minutes
+      MetricName: CPUUtilization
+      Namespace: AWS/EC2
+      Statistic: Average
+      Period: '300'
+      EvaluationPeriods: '2'
+      Threshold: '90'
+      AlarmActions:
+      - Ref: WebServerScaleUpPolicyB
+      Dimensions:
+      - Name: AutoScalingGroupName
+        Value:
+          Ref: WebServerGroupBlue
+      ComparisonOperator: GreaterThanThreshold   
+  CPUAlarmLowB:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Scale-down if CPU < 70% for 10 minutes
+      MetricName: CPUUtilization
+      Namespace: AWS/EC2
+      Statistic: Average
+      Period: '300'
+      EvaluationPeriods: '2'
+      Threshold: '70'
+      AlarmActions:
+      - Ref: WebServerScaleDownPolicyB
+      Dimensions:
+      - Name: AutoScalingGroupName
+        Value:
+          Ref: WebServerGroupBlue
+      ComparisonOperator: LessThanThreshold
+
+  WebServerScaleUpPolicyG:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AdjustmentType: ChangeInCapacity
+      AutoScalingGroupName:
+        Ref: WebServerGroupGreen
+      Cooldown: '60'
+      ScalingAdjustment: '1' 
+  WebServerScaleDownPolicyG:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AdjustmentType: ChangeInCapacity
+      AutoScalingGroupName:
+        Ref: WebServerGroupGreen
+      Cooldown: '60'
+      ScalingAdjustment: "-1"   
+  CPUAlarmHighG:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Scale-up if CPU > 90% for 10 minutes
+      MetricName: CPUUtilization
+      Namespace: AWS/EC2
+      Statistic: Average
+      Period: '300'
+      EvaluationPeriods: '2'
+      Threshold: '90'
+      AlarmActions:
+      - Ref: WebServerScaleUpPolicyG
+      Dimensions:
+      - Name: AutoScalingGroupName
+        Value:
+          Ref: WebServerGroupGreen
+      ComparisonOperator: GreaterThanThreshold   
+  CPUAlarmLowG:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Scale-down if CPU < 70% for 10 minutes
+      MetricName: CPUUtilization
+      Namespace: AWS/EC2
+      Statistic: Average
+      Period: '300'
+      EvaluationPeriods: '2'
+      Threshold: '70'
+      AlarmActions:
+      - Ref: WebServerScaleDownPolicyG
+      Dimensions:
+      - Name: AutoScalingGroupName
+        Value:
+          Ref: WebServerGroupGreen
+      ComparisonOperator: LessThanThreshold
+
+######################## LOADBALANCER #################################
+  ApplicationLoadBalancer:
+      Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+      DependsOn:
+      - NATGateway
+      - BlueTargetGroup
+      - GreenTargetGroup
+      Properties: 
+        IpAddressType: ipv4
+        Name: POCLoadBalancer
+        Scheme: internet-facing
+        SecurityGroups: 
+          - Ref: lbswsg
+          - Ref: elbsg
+        Subnets: 
+          - !Ref BluePublicSubnet1
+          - !Ref GreenPublicSubnet2     
+        Tags: 
+        - Key: Name
+          Value: POCLoadBalancer
+        Type: application
+######################## LOADBALANCER LISTENER ######################################
+  ListenerRule1:
+    Type: 'AWS::ElasticLoadBalancingV2::ListenerRule'
+    Properties:
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref BlueTargetGroup
+      Conditions:
+        - Field: http-header
+          HttpHeaderConfig:
+            HttpHeaderName: User-Agent
+            Values:
+              - Chrome
+        - Field: http-header
+          HttpHeaderConfig:
+            HttpHeaderName: Referer
+            Values:
+              - 'https://www.amazon.com/'
+      ListenerArn: !Ref Listener
+      Priority: 1
+
+  ListenerRule2:
+    Type: 'AWS::ElasticLoadBalancingV2::ListenerRule'
+    Properties:
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref GreenTargetGroup
+      Conditions:
+        - Field: http-header
+          HttpHeaderConfig:
+            HttpHeaderName: User-Agent
+            Values:
+              - Chrome
+      ListenerArn: !Ref Listener
+      Priority: 2
+
+  Listener:
+    Type: 'AWS::ElasticLoadBalancingV2::Listener'
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !If [IsBlueEnvironment, !Ref BlueTargetGroup, !Ref GreenTargetGroup]
+
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: '80'
+      Protocol: HTTP
+
+######################## LOADBALANCER TARGET GROUPS #################################
+  BlueTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name:
+        Fn::Join:
+        - "-"
+        - - Ref: AWS::StackName
+          - BlueTargetGroup
+      Port: 80
+      Protocol: HTTP
+      VpcId:
+        Ref: VPC
+  GreenTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name:
+        Fn::Join:
+        - "-"
+        - - Ref: AWS::StackName
+          - GreenTargetGroup
+      Port: 80
+      Protocol: HTTP
+      VpcId:
+        Ref: VPC
+
+######################## SECURITY GROUPS #################################
+  dbsg:
+        Type: AWS::EC2::SecurityGroup
+        DependsOn: VPC
+        Properties: 
+          GroupDescription: db-selfreference
+          VpcId: !Ref VPC 
+  InSelfReferenceRuleDBSG:
+    Type: AWS::EC2::SecurityGroupIngress
+   
+    Properties:
+     
+      IpProtocol: "-1" #-1 used for all traffic
+      SourceSecurityGroupId: !Ref dbsg
+      GroupId: !Ref dbsg
+  EgSelfReferenceRuleDBSG:
+    Type: AWS::EC2::SecurityGroupEgress
+   
+    Properties:
+     
+      IpProtocol: "-1" #-1 used for all traffic
+      SourceSecurityGroupId: !Ref dbsg
+      GroupId: !Ref dbsg
+  lbswsg:
+        Type: AWS::EC2::SecurityGroup
+        DependsOn: VPC
+        Properties: 
+          GroupDescription: loadbalancer-selfreference
+          VpcId: !Ref VPC 
+  InSelfReferenceRuleELBWSSG:
+    Type: AWS::EC2::SecurityGroupIngress
+  
+    Properties:
+     
+      IpProtocol: "-1" #-1 used for all traffic
+      SourceSecurityGroupId: !Ref lbswsg
+      GroupId: !Ref lbswsg
+  EgSelfReferenceRuleELBWSSG:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+    
+      IpProtocol: "-1" #-1 used for all traffic
+      SourceSecurityGroupId: !Ref lbswsg
+      GroupId: !Ref lbswsg
+  elbsg:
+    Type: AWS::EC2::SecurityGroup
+    DependsOn: VPC
+    Properties:
+      VpcId: !Ref VPC
+      GroupDescription: "Allow http"
+      SecurityGroupIngress:
+      - CidrIp: 0.0.0.0/0
+        FromPort: '80'
+        IpProtocol: tcp
+        ToPort: '80'
+      - CidrIp: 0.0.0.0/0
+        FromPort: '443'
+        IpProtocol: tcp
+        ToPort: '443'
+  natsg:
+    Type: AWS::EC2::SecurityGroup
+    DependsOn: VPC
+    Properties:
+      VpcId: !Ref VPC
+      GroupDescription: "Allow ssh"
+      SecurityGroupIngress:
+      - CidrIp: 10.0.0.0/16
+        FromPort: '22'
+        IpProtocol: tcp
+        ToPort: '22'
+      SecurityGroupEgress:
+      - CidrIp: 0.0.0.0/0
+        FromPort: '443'
+        IpProtocol: tcp
+        ToPort: '443'
+      - CidrIp: 0.0.0.0/0
+        FromPort: '80'
+        IpProtocol: tcp
+        ToPort: '80'
+
+######################## VPC #################################
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      Tags:
+      - Key: Name
+        Value: POCVPCNEW
+
+######################## VPC ENDPOINT ###############################
+  VPCEndPoint:
+    Type: AWS::EC2::VPCEndpoint
+    DependsOn: VPC
+    Properties:
+      PolicyDocument: '{
+        "Version":"2012-10-17",
+        "Statement":[{
+          "Effect":"Allow",
+          "Principal": "*",
+          "Action":"*",
+          "Resource":[
+            "arn:aws:s3:::repo.eu-west-1.amazonaws.com",
+            "arn:aws:s3:::repo.eu-west-1.amazonaws.com/*"
+          ]
+        }]
+      }'
+      RouteTableIds:
+        - !Ref PublicRouteTable
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.s3
+      VpcId: !Ref VPC
+
+######################## NAT GATEWAY ################################# 
+  NATGateway:
+    Type: AWS::EC2::NatGateway
+    DependsOn: VPC
+    Properties: 
+      AllocationId:
+          Fn::GetAtt:
+          - BlueEIP
+          - AllocationId
+      SubnetId:  !If [IsBlueEnvironment, !Ref BluePublicSubnet1, !Ref GreenPublicSubnet2]
+      # SubnetId:
+      #   Ref: BluePublicSubnet1
+      Tags: 
+      - Key: Name
+        Value: POC NATGateway
+  BlueEIP:
+    DependsOn: AttachGateway
+    Type: AWS::EC2::EIP
+    Properties:
+        Domain: VPC
+
+######################## IGW #################################
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+      - Key: Name
+        Value: POC Internet Gateway
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+######################## SUBNETS #################################
+  BluePublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select 
+        - '0'
+        - !GetAZs ''
+      Tags:
+        - Key: Name
+          Value: Public Subnet 1
+  BluePrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select 
+        - '0'
+        - !GetAZs ''
+      Tags:
+        - Key: Name
+          Value: Private Subnet 1
+
+  GreenPublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.3.0/24
+      AvailabilityZone: !Select 
+        - '1'
+        - !GetAZs ''
+      Tags:
+        - Key: Name
+          Value: Public Subnet 2
+  GreenPrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.4.0/24
+      AvailabilityZone: !Select 
+        - '1'
+        - !GetAZs ''
+      Tags:
+        - Key: Name
+          Value: Private Subnet 2
+
+######################## ROUTING #################################
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: Public Route Table
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: Private Route Table
+  PublicRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NATGateway
+  PublicSubnetRouteTableAssociation1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref BluePublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+  PublicSubnetRouteTableAssociation2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref GreenPublicSubnet2
+      RouteTableId: !Ref PublicRouteTable 
+  PrivateSubnetRouteTableAssociation1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref BluePrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+  PrivateSubnetRouteTableAssociation2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref GreenPrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable
+     
+Outputs:
+  VPC:
+    Description: VPC
+    Value: !Ref VPC
+
+  AZ1:
+    Description: Availability Zone 1
+    Value: !GetAtt
+      - BluePublicSubnet1
+      - AvailabilityZone
+
+  AZ2:
+    Description: Availability Zone 2
+    Value: !GetAtt
+      - GreenPublicSubnet2
+      - AvailabilityZone
+
+  Cloud9URL:
+    Description: Cloud9 Environment
+    Value:
+      Fn::Join:
+      - ''
+      - - !Sub https://${AWS::Region}.console.aws.amazon.com/cloud9/ide/
+        - !Ref Cloud9env
+
+  ApploadbalancerURL:
+    Description: ALB DNS Name 
+    Value:
+      Fn::Join:
+        - ''
+        - - "http://"
+          - Fn::GetAtt: ApplicationLoadBalancer.DNSName
+
+    ########## ARNs output for cli to switch deployments
+  ApploadbalancerListenerARN:
+    Description: ALB ARN
+    Value: !Ref Listener
+  
+  BlueTargetGroupARN:
+    Description: Blue Target Group ARN
+    Value: !Ref BlueTargetGroup
+
+  GreenTargetGroupARN:
+    Description: Green Target Group ARN
+    Value: !Ref GreenTargetGroup
+  
+  awscliblueSwitch:
+    Description: "aws cli command for blue switching"
+    Value: !Join ["", ["aws elbv2 modify-listener --listener-arn ", !Ref Listener, " --default-actions Type=forward,TargetGroupArn=", !Ref BlueTargetGroup  ]]
+
+  awscligreenSwitch:
+    Description: "aws cli command for green switching"
+    Value: !Join ["", ["aws elbv2 modify-listener --listener-arn ", !Ref Listener, " --default-actions Type=forward,TargetGroupArn=", !Ref GreenTargetGroup  ]]
+
+
+  Websginuse:
+    Description: "WebServerGroup in use"
+    Value: !Join ["", [WebServerGroup,!Ref ENV]]
+
+
+
